@@ -30,12 +30,15 @@ Admin commands:
 """
 import logging
 import re
+import asyncio
 
 from pyplanet.apps.config import AppConfig
 from pyplanet.apps.core.maniaplanet import callbacks as mp_signals
+from pyplanet.apps.core.maniaplanet.models import Player
 from pyplanet.contrib.command import Command
 from pyplanet.contrib.setting import Setting
 from pyplanet.views import View
+from pyplanet.views.generics.alert import show_alert
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +58,6 @@ main() {
 }
 ]]></script>
 """
-
 
 class OpenplanetProbeView(View):
 	"""Hidden manialink carrying the detection script."""
@@ -100,6 +102,11 @@ class OpenplanetControl(AppConfig):
 						"SCHOOL, DEVMODE or a competition profile name.",
 			default=['OFFICIAL'],
 		)
+		self.setting_kick_timeout = Setting(
+			'kick_timeout', 'Kick timeout', Setting.CAT_BEHAVIOUR, type=int,
+			description='Timeout until a player with incorrect signature mode is kicked',
+			default = 5
+		)
 		self.setting_announce = Setting(
 			'kick_announce_message', 'Kick announcement message', Setting.CAT_BEHAVIOUR, type=str,
 			description='Chat message broadcast when a player is kicked. '
@@ -107,10 +114,27 @@ class OpenplanetControl(AppConfig):
 			default='$ff0⚠ $<$fff{nickname}$>$ff0 was kicked: Openplanet $<$fff{mode}$>$ff0 mode '
 					'is not allowed on this server (allowed: $<$fff{allowed}$>$ff0).',
 		)
+		self.setting_admin_allowed = Setting(
+			'admin_allowed_bypass', 'Allow admins to bypass allowed modes', Setting.CAT_BEHAVIOUR, type=bool,
+			description="Sets whether admins should be able to bypass the allowed signature modes "
+						"and connect to the server with any signature level",
+			default = False
+		)
+		self.setting_spectator_allowed = Setting(
+			'spectator_allowed_bypass', 'Allow spectators to bypass allowed modes', Setting.CAT_BEHAVIOUR, type=bool,
+			description="Sets whether spectators should be able to bypass the allowed signature modes "
+						"and connect to the server with any signature level",
+			default = False
+		)
 
 	async def on_start(self):
 		await self.context.setting.register(
-			self.setting_enabled, self.setting_allowed_modes, self.setting_announce,
+			self.setting_enabled,
+			self.setting_allowed_modes,
+			self.setting_kick_timeout,
+			self.setting_announce,
+			self.setting_admin_allowed,
+			self.setting_spectator_allowed
 		)
 
 		await self.instance.permission_manager.register(
@@ -126,6 +150,8 @@ class OpenplanetControl(AppConfig):
 		)
 
 		self.context.signals.listen(mp_signals.player.player_connect, self.on_connect)
+		self.context.signals.listen(mp_signals.player.player_enter_player_slot, self.on_connect)
+		self.context.signals.listen(mp_signals.player.player_enter_spectator_slot, self.on_disconnect)
 		self.context.signals.listen(mp_signals.player.player_disconnect, self.on_disconnect)
 
 		# Also probe players already online when the app (re)starts.
@@ -141,8 +167,6 @@ class OpenplanetControl(AppConfig):
 	# == Signals ==============================================================
 
 	async def on_connect(self, player, **kwargs):
-		if not await self.setting_enabled.get_value():
-			return
 		await self.probe.display(player_logins=[player.login])
 
 	async def on_disconnect(self, player, **kwargs):
@@ -165,9 +189,6 @@ class OpenplanetControl(AppConfig):
 		)
 
 	async def on_report(self, player, raw):
-		# Only act on the first report per session (join-time check).
-		if player.login in self.reports:
-			return
 		report = self.parse_info(raw)
 		self.reports[player.login] = report
 		logger.debug('Openplanet report from %s: %r', player.login, raw)
@@ -181,18 +202,27 @@ class OpenplanetControl(AppConfig):
 		if report['mode'] in allowed:
 			return
 
+
+		if await self.setting_admin_allowed.get_value() and player.level == Player.LEVEL_MASTER:
+			return
+
+		if await self.setting_spectator_allowed.get_value() and player.flow.is_spectator:
+			return
+
 		allowed_text = ', '.join(allowed) if allowed else '(none)'
 		logger.info(
 			'Kicking %s: Openplanet mode %s not allowed (version %s).',
 			player.login, report['mode'], report['version'],
 		)
 		try:
-			await self.instance.gbx(
-				'Kick', player.login,
-				'Openplanet signature mode {} is not allowed on this server. '
-				'Allowed: {}. Switch via the Openplanet menu (F3) and rejoin.'.format(
-					report['mode'], allowed_text),
+			kick_message = ('Openplanet signature mode $FF0{}$g is not allowed on this server.'
+				'Allowed: $FF0{}$g. Switch via the Openplanet menu (F3) and rejoin.').format(report['mode'], allowed_text)
+			await self.instance.chat(kick_message, player.login)
+			await asyncio.wait(
+				{show_alert(player, kick_message, "lg")},
+				timeout=await self.setting_kick_timeout.get_value()
 			)
+			await self.instance.gbx('Kick', player.login, kick_message)
 		except Exception as exc:
 			# Player may have left already.
 			logger.debug('Kick of %s failed: %s', player.login, exc)
