@@ -5,12 +5,13 @@ To check a player, a hidden ManiaLink is sent to their client. Its
 ManiaScript reads System.ExtraTool_Info (populated by Openplanet, empty on
 vanilla clients) and reports it back once via TriggerPageAction. If the
 player runs Openplanet in a signature mode that is not in the allowed list,
-they are kicked immediately and (optionally) an announcement is posted in
-the server chat.
+they are told why (chat message + alert), kicked after a short timeout and
+(optionally) an announcement is posted in the server chat.
 
-The check runs when a player joins (while enabled) and for everyone online
-when the app starts. If a player changes signature mode later, it goes
-unnoticed until they rejoin or an admin runs //opcheck.
+The check runs when a player joins or moves from spectator to player (while
+enabled) and for everyone online when the app starts. If a player changes
+signature mode later, it goes unnoticed until they rejoin or an admin runs
+//opcheck.
 
 Settings (//settings):
   * enabled: master switch. Default: False.
@@ -18,6 +19,12 @@ Settings (//settings):
     Default: ['OFFICIAL']. Players without Openplanet are always allowed.
     Any existing signature mode works, e.g. OFFICIAL, REGULAR, SCHOOL,
     DEVMODE or a competition profile name.
+  * kick_timeout: seconds the player sees the alert before being kicked
+    (clicking OK kicks right away). Default: 5.
+  * admin_allowed_bypass: admins (level Admin and above) may join with any
+    signature mode. Default: False.
+  * spectator_allowed_bypass: spectators may stay with any signature mode;
+    they are checked again when they switch to player. Default: False.
   * kick_announce_message: chat message broadcast to the server when a
     player is kicked. Placeholders: {nickname}, {login}, {mode}, {allowed}.
     Set empty to disable the announcement.
@@ -59,6 +66,7 @@ main() {
 ]]></script>
 """
 
+
 class OpenplanetProbeView(View):
 	"""Hidden manialink carrying the detection script."""
 
@@ -89,6 +97,7 @@ class OpenplanetControl(AppConfig):
 
 		self.probe = OpenplanetProbeView(self)
 		self.reports = dict()  # login -> dict(raw, has_op, version, mode)
+		self.kicking = set()  # logins with a kick in progress (alert shown)
 
 		self.setting_enabled = Setting(
 			'enabled', 'Enable Openplanet check', Setting.CAT_BEHAVIOUR, type=bool,
@@ -104,8 +113,8 @@ class OpenplanetControl(AppConfig):
 		)
 		self.setting_kick_timeout = Setting(
 			'kick_timeout', 'Kick timeout', Setting.CAT_BEHAVIOUR, type=int,
-			description='Timeout until a player with incorrect signature mode is kicked',
-			default = 5
+			description='Seconds a player with a disallowed signature mode sees the alert before being kicked.',
+			default=5,
 		)
 		self.setting_announce = Setting(
 			'kick_announce_message', 'Kick announcement message', Setting.CAT_BEHAVIOUR, type=str,
@@ -116,15 +125,15 @@ class OpenplanetControl(AppConfig):
 		)
 		self.setting_admin_allowed = Setting(
 			'admin_allowed_bypass', 'Allow admins to bypass allowed modes', Setting.CAT_BEHAVIOUR, type=bool,
-			description="Sets whether admins should be able to bypass the allowed signature modes "
-						"and connect to the server with any signature level",
-			default = False
+			description="Sets whether admins (level Admin and above) should be able to bypass the allowed "
+						"signature modes and connect to the server with any signature level",
+			default=False,
 		)
 		self.setting_spectator_allowed = Setting(
 			'spectator_allowed_bypass', 'Allow spectators to bypass allowed modes', Setting.CAT_BEHAVIOUR, type=bool,
 			description="Sets whether spectators should be able to bypass the allowed signature modes "
 						"and connect to the server with any signature level",
-			default = False
+			default=False,
 		)
 
 	async def on_start(self):
@@ -134,7 +143,7 @@ class OpenplanetControl(AppConfig):
 			self.setting_kick_timeout,
 			self.setting_announce,
 			self.setting_admin_allowed,
-			self.setting_spectator_allowed
+			self.setting_spectator_allowed,
 		)
 
 		await self.instance.permission_manager.register(
@@ -151,7 +160,7 @@ class OpenplanetControl(AppConfig):
 
 		self.context.signals.listen(mp_signals.player.player_connect, self.on_connect)
 		self.context.signals.listen(mp_signals.player.player_enter_player_slot, self.on_connect)
-		self.context.signals.listen(mp_signals.player.player_enter_spectator_slot, self.on_disconnect)
+		self.context.signals.listen(mp_signals.player.player_enter_spectator_slot, self.on_enter_spectator)
 		self.context.signals.listen(mp_signals.player.player_disconnect, self.on_disconnect)
 
 		# Also probe players already online when the app (re)starts.
@@ -167,9 +176,16 @@ class OpenplanetControl(AppConfig):
 	# == Signals ==============================================================
 
 	async def on_connect(self, player, **kwargs):
+		if not await self.setting_enabled.get_value():
+			return
 		await self.probe.display(player_logins=[player.login])
 
 	async def on_disconnect(self, player, **kwargs):
+		self.reports.pop(player.login, None)
+		self.kicking.discard(player.login)
+
+	async def on_enter_spectator(self, player, **kwargs):
+		# Forget the report; the player is checked again when back in a player slot.
 		self.reports.pop(player.login, None)
 
 	# == Detection ============================================================
@@ -202,31 +218,47 @@ class OpenplanetControl(AppConfig):
 		if report['mode'] in allowed:
 			return
 
-
-		if await self.setting_admin_allowed.get_value() and player.level == Player.LEVEL_MASTER:
+		if await self.setting_admin_allowed.get_value() and player.level >= Player.LEVEL_ADMIN:
 			return
 
 		if await self.setting_spectator_allowed.get_value() and player.flow.is_spectator:
 			return
+
+		# A second report can arrive while the alert is shown (//opcheck, slot
+		# switch, ...): only one kick per player at a time.
+		if player.login in self.kicking:
+			return
+		self.kicking.add(player.login)
 
 		allowed_text = ', '.join(allowed) if allowed else '(none)'
 		logger.info(
 			'Kicking %s: Openplanet mode %s not allowed (version %s).',
 			player.login, report['mode'], report['version'],
 		)
+		kick_message = (
+			'Openplanet signature mode $FF0{}$g is not allowed on this server. '
+			'Allowed: $FF0{}$g. Switch via the Openplanet menu (F3) and rejoin.'
+		).format(report['mode'], allowed_text)
 		try:
-			kick_message = ('Openplanet signature mode $FF0{}$g is not allowed on this server.'
-				'Allowed: $FF0{}$g. Switch via the Openplanet menu (F3) and rejoin.').format(report['mode'], allowed_text)
-			await self.instance.chat(kick_message, player.login)
-			await asyncio.wait(
-				{show_alert(player, kick_message, "lg")},
-				timeout=await self.setting_kick_timeout.get_value()
-			)
+			try:
+				await self.instance.chat(kick_message, player.login)
+				# wait_for cancels the alert on timeout (asyncio.wait would leave it
+				# pending forever, and rejects bare coroutines on Python 3.11+).
+				timeout = max(0, int(await self.setting_kick_timeout.get_value() or 0))
+				await asyncio.wait_for(show_alert(player, kick_message, 'lg'), timeout=timeout)
+			except asyncio.TimeoutError:
+				pass
+			except Exception as exc:
+				# Telling the player failed; still enforce the kick.
+				logger.debug('Kick notice for %s failed: %s', player.login, exc)
+
 			await self.instance.gbx('Kick', player.login, kick_message)
 		except Exception as exc:
 			# Player may have left already.
 			logger.debug('Kick of %s failed: %s', player.login, exc)
 			return
+		finally:
+			self.kicking.discard(player.login)
 
 		announce = str(await self.setting_announce.get_value() or '').strip()
 		if announce:
