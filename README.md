@@ -68,9 +68,7 @@ Admin commands:
 
 ## Caveats
 
-- A player can pass the check in `OFFICIAL` and switch to `DEVMODE`
-  afterwards. This goes unnoticed until they rejoin or an admin runs
-  `//opcheck`.
+The OpenPlanet config API is used to get the competition profile names, according to Miss this may not be "super stable", so the plugin will retry 3 times, then fall back to the profile ID's (e.g FASTLEARN instead of "Generic Fastlearn Competition")
 
 ## License
 
